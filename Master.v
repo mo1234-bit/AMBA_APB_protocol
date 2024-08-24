@@ -79,6 +79,11 @@ assign PSEL1=((cs==SETUP||cs==ACCESS)&&PADDR[8]==1)?1:0;
 assign PSEL2=((cs==SETUP||cs==ACCESS)&&PADDR[8]==0)?1:0;
 //output logic
 always @(posedge PCLK)begin
+     if(~PRESETn)begin
+     PADDR<=0;
+     PWDATA<=0;
+apb_read_data_out<=0;end
+ else
 	if(cs==SETUP&&READ_WRITE)
 	PADDR<=apb_read_paddr;
 	else if(cs==SETUP&&~READ_WRITE) begin
@@ -110,4 +115,3 @@ always@(*)begin
 end
 assign PSLVERR=(setup_error||invalid_write_data||invalid_write_paddr||invalid_read_paddr)?1:0;
 endmodule
-
