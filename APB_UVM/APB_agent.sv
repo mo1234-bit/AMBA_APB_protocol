@@ -1,6 +1,6 @@
-package spi_agent;
-	import spi_config::*;
-	import spi_seq_item::*;
+package APB_agent;
+	import APB_config::*;
+	import APB_seq_item::*;
 	import spi_sequencer::*;
 	import spi_monitor::*;
 	import spi_driver::*;
@@ -40,4 +40,5 @@ class spi_agent extends  uvm_agent;
 	 	mon.mon_ap.connect(agt_ap);
 	 		 endfunction  
 endclass : spi_agent
+
 endpackage : spi_agent
