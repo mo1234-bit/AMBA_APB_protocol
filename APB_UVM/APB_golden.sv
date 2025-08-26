@@ -1,136 +1,115 @@
-module SPI_ref(MOSI,MISO,SS_n,clk,rst_n,rx_data,rx_valid,tx_data,tx_valid);
-input MOSI,SS_n,clk,rst_n,tx_valid;
-input [7:0]tx_data;
-output reg MISO,rx_valid;
-output reg[9:0]rx_data;
-parameter IDLE=3'b000;
-parameter CHK_CMD=3'b001;
-parameter WRITE=3'b010;
-parameter READ_ADD=3'b011;
-parameter READ_DATA=3'b100;
-reg read_sel;
-reg [2:0]cs,ns;
-reg [4:0]counter;
-reg [2:0]counter1;
-always @(posedge clk ) begin
-	if (~rst_n) 
-		cs<=IDLE;
-	else 
-		cs<=ns;
-end
-always@(*)begin
-	case(cs)
-	IDLE:begin
-		if(SS_n)
-		ns=IDLE;
-		else begin
-		ns=CHK_CMD;
-		end
-	end
-
-	CHK_CMD:begin
-     if(SS_n)begin
-            ns=IDLE;end
-		else if(SS_n==0&&MOSI==0)begin
-		ns=WRITE;end
-		else if(SS_n==0&&MOSI==1&&read_sel==0)begin
-		ns=READ_ADD;end
-		else 
-		ns=READ_DATA;
-	end
-	WRITE:begin
-	if (SS_n==0)
-	ns=WRITE;	
-	else 
-	ns=IDLE;
-	end
-	READ_ADD:begin
-	 if(SS_n==0)
-		ns=READ_ADD;
-		else
+module master_bridge_ref(apb_write_paddr,apb_read_paddr,apb_write_data,PRDATA,PRESETn,PCLK,READ_WRITE,transfer,
+    PREADY,PSEL1,PSEL2,PENABLE,PADDR,PWRITE,PWDATA,apb_read_data_out,PSLVERR);
+    parameter IDLE=0;
+        parameter SETUP=1;
+        parameter ACCESS=2;
+    input [8:0]apb_write_paddr,apb_read_paddr;
+    input [7:0] apb_write_data,PRDATA;        
+    input PRESETn,PCLK,READ_WRITE,transfer,PREADY;
+    output PSEL1,PSEL2;
+    output reg PENABLE;
+    output reg [8:0]PADDR;
+    output reg PWRITE;
+    output reg [7:0]PWDATA,apb_read_data_out;
+    output PSLVERR;
+    (*fsm_encoding="one_hot"*)
+    reg [1:0]ns,cs;
+    //error signals
+    reg setup_error ;
+    reg invalid_read_paddr;
+    reg invalid_write_paddr;
+    reg invalid_write_data;
+//state memory
+    always @(posedge PCLK) begin
+        if (~PRESETn) begin
+            cs<=IDLE;
+        end
+        else begin
+            cs<=ns;
+        end
+    end
+//next state logic
+    always@(*)begin
+    PWRITE=~READ_WRITE;
+        case(cs)
+        IDLE:begin
+            PENABLE=0;
+            if(transfer)
+            ns=SETUP;
+            else begin
                 ns=IDLE;
-	end
-	READ_DATA:begin
-		if(SS_n==0)
-            ns=READ_DATA;
-            else
-                    ns=IDLE;
-    end
-    default: 
-    ns=IDLE;
-    
-    endcase
-    end
-    always @(posedge clk) begin
-    	if (~rst_n) begin
-    	read_sel<=0;
-    	rx_data<=10'h3ff;
-    	MISO<=0;
-    	rx_valid<=0;
-    	counter<='h0a;
-    	counter1<=0;
-    	end else begin
-    	case(cs)
-    	WRITE:begin
-       
-    	       if(counter>=0)begin
-                rx_data [counter] <= MOSI;
-                counter <= counter - 1 ;     
-                if(counter == 0) begin
-                    counter <= 10;  
-                    rx_valid <= 1;
-                end  else if(counter!=0)
-                   rx_valid<=0;
-                    end
-                    end
-    	
-    	READ_ADD: begin
-
-    	if(counter>=0)begin
-    	rx_data[counter] <= MOSI;
-                counter <= counter - 1;
-                if(counter ==0 ) begin
-                    counter <= 10;
-                    rx_valid <= 1;end
-                    else if(counter!=0)
-                    rx_valid<=0;
+            end
         end
-        read_sel<=1;
-    	
-    	end
-        READ_DATA:begin
+        SETUP:begin
+            PENABLE=0;
+            if(transfer&&~PSLVERR)
+            ns=ACCESS;
+            else if(~transfer&&~PSLVERR) begin
+                ns=SETUP;
+            end
+            else begin
+            ns=IDLE;
+            end
+        end
+        ACCESS:begin
+            PENABLE=1;
+            if(transfer&&~PSLVERR)begin
+                if(PREADY)begin     
+                    ns=SETUP;
+                    end
+                end 
+                else
+                    ns=ACCESS;
             
-        if(counter>=0)begin
-                rx_data[counter] <= MOSI;
-                counter<=counter-1;end
-                if(counter==8)
-                rx_valid<=1;
-                else 
-                    
-                rx_valid<=0;
-                
-                if(counter==0)begin
-                rx_valid<=0;
-                counter<=10;
-            end
-            if(tx_valid==1)begin
-            if(counter1>=0)begin
-                MISO<=tx_data[counter1];
-                if(counter1!=0)
-                counter1<=counter1-1;
-                // if(counter1==0)
-                // counter1<=7;
-            end
-            read_sel<=0;
-            end
+        end     else 
+            ns=IDLE; 
+        
+        end
+        default:begin
+            ns=IDLE;
+            PENABLE=0;
+        end
+        endcase
+    end
+//slave select depend on the last bit of PADDR and cs
+assign PSEL1=((cs==SETUP||cs==ACCESS)&&PADDR[8]==1)?1:0;
+assign PSEL2=((cs==SETUP||cs==ACCESS)&&PADDR[8]==0)?1:0;
+//output logic
+always @(posedge PCLK)begin
+     if(~PRESETn)begin
+     PADDR<=0;
+     PWDATA<=0;
+apb_read_data_out<=0;end
+ else
+    if(cs==SETUP&&READ_WRITE)
+    PADDR<=apb_read_paddr;
+    else if(cs==SETUP&&~READ_WRITE) begin
+    PADDR<=apb_write_paddr;
+    PWDATA<=apb_write_data;
+    end
+    if(cs==ACCESS&&transfer&&~PSLVERR&&PREADY&&READ_WRITE)
+    apb_read_data_out<=PRDATA;
 end
-    	 IDLE:begin
-        MISO<=0;
-            counter1 <= 6;
-           
-    	end
-        default: rx_data<=10'h000;
-        endcase 
-        end
-        end
-        endmodule
+
+
+//transfer failure and error respondes
+always@(*)begin
+    if(cs==IDLE&&ns==ACCESS)
+    setup_error=1;
+    else 
+        setup_error=0;
+    if((apb_write_data===8'dx) && (~READ_WRITE) && (cs==SETUP || cs==ACCESS))
+    invalid_write_data=1;
+    else
+     invalid_write_data=0;
+     if((apb_read_paddr===9'dx) && READ_WRITE && (cs==SETUP || cs==ACCESS))
+          invalid_read_paddr = 1;
+      else  invalid_read_paddr = 0;
+    if((apb_write_paddr===9'dx) && (~READ_WRITE) && (cs==SETUP || cs==ACCESS))
+          invalid_write_paddr =1;
+          else invalid_write_paddr =0;
+    
+end
+assign PSLVERR=(setup_error||invalid_write_data||invalid_write_paddr||invalid_read_paddr)?1:0;
+endmodule
+
