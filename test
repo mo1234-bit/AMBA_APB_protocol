@@ -1,0 +1,512 @@
+// =============================================================================
+// APB Testbench
+// Tests: reset, single write, single read, back-to-back, slave2, wait states,
+//        byte-lane strobes, PSLVERR conditions, bus protocol compliance checks.
+// =============================================================================
+`timescale 1ns/1ps
+
+module APB_tb;
+
+    // =========================================================================
+    // DUT signals
+    // =========================================================================
+    reg         PCLK, PRESETn;
+    reg         transfer, READ_WRITE;
+    reg  [31:0] apb_write_paddr, apb_write_data, apb_read_paddr;
+    reg  [2:0]  pprot_in;
+    reg  [3:0]  pstrb_in;
+    wire        PSLVERR;
+    wire [31:0] apb_read_data_out;
+
+    // Internal APB bus observation wires (via DUT sub-module hierarchy)
+    wire [31:0] PADDR;
+    wire [31:0] PWDATA;
+    wire [31:0] PRDATA;
+    wire        PWRITE, PENABLE, PSEL1, PSEL2, PREADY;
+    wire [2:0]  PPROT;
+    wire [3:0]  PSTRB;
+
+    // =========================================================================
+    // DUT instantiation
+    // =========================================================================
+    APB dut (
+        .PCLK             (PCLK),
+        .PRESETn          (PRESETn),
+        .transfer         (transfer),
+        .READ_WRITE       (READ_WRITE),
+        .apb_write_paddr  (apb_write_paddr),
+        .apb_write_data   (apb_write_data),
+        .apb_read_paddr   (apb_read_paddr),
+        .pprot_in         (pprot_in),
+        .pstrb_in         (pstrb_in),
+        .PSLVERR          (PSLVERR),
+        .apb_read_data_out(apb_read_data_out)
+    );
+
+    // Observe internal APB signals via hierarchy
+    assign PADDR   = dut.PADDR;
+    assign PWDATA  = dut.PWDATA;
+    assign PRDATA  = dut.PRDATA;
+    assign PWRITE  = dut.PWRITE;
+    assign PENABLE = dut.PENABLE;
+    assign PSEL1   = dut.PSEL1;
+    assign PSEL2   = dut.PSEL2;
+    assign PREADY  = dut.PREADY;
+    assign PPROT   = dut.PPROT;
+    assign PSTRB   = dut.PSTRB;
+
+    // =========================================================================
+    // Clock — 10 ns period (100 MHz)
+    // =========================================================================
+    initial PCLK = 0;
+    always #5 PCLK = ~PCLK;
+
+    // =========================================================================
+    // Test tracking
+    // =========================================================================
+    integer test_num;
+    integer pass_count;
+    integer fail_count;
+
+    // =========================================================================
+    // Tasks
+    // =========================================================================
+
+    // ---- Drive signals to idle / default state ----------------------------
+    task drive_idle;
+        begin
+            transfer         = 0;
+            READ_WRITE       = 0;
+            apb_write_paddr  = 32'd0;
+            apb_write_data   = 32'd0;
+            apb_read_paddr   = 32'd0;
+            pprot_in         = 3'b000;
+            pstrb_in         = 4'b1111;
+        end
+    endtask
+
+    // ---- Wait for rising edge(s) ------------------------------------------
+    task clk_delay;
+        input integer n;
+        integer i;
+        begin
+            for (i = 0; i < n; i = i + 1)
+                @(posedge PCLK);
+            #1; // small delta after edge
+        end
+    endtask
+
+    // ---- Full write transaction -------------------------------------------
+    // addr[8]==1 → Slave1, addr[8]==0 → Slave2
+    task apb_write;
+        input [31:0] addr;
+        input [31:0] data;
+        input [3:0]  strb;
+        begin
+            @(negedge PCLK);
+            READ_WRITE      = 0;      // write
+            apb_write_paddr = addr;
+            apb_write_data  = data;
+            pstrb_in        = strb;
+            transfer        = 1;
+            // Wait until transfer completes (PENABLE && PREADY)
+            @(posedge PCLK); // IDLE→SETUP
+            @(posedge PCLK); // SETUP→ACCESS
+            // Poll for PREADY
+            while (!PREADY) @(posedge PCLK);
+            @(negedge PCLK);
+            transfer = 0;
+            @(posedge PCLK); // return to IDLE
+            #1;
+        end
+    endtask
+
+    // ---- Full read transaction --------------------------------------------
+    task apb_read;
+        input [31:0] addr;
+        output [31:0] rdata;
+        begin
+            @(negedge PCLK);
+            READ_WRITE     = 1;       // read
+            apb_read_paddr = addr;
+            transfer       = 1;
+            @(posedge PCLK); // IDLE→SETUP
+            @(posedge PCLK); // SETUP→ACCESS
+            while (!PREADY) @(posedge PCLK);
+            @(negedge PCLK);
+            rdata    = apb_read_data_out;
+            transfer = 0;
+            @(posedge PCLK);
+            #1;
+        end
+    endtask
+
+    // ---- Checker macro (as task) ------------------------------------------
+    task check;
+        input [127:0] test_name; // just a string label for display
+        input         condition;
+        begin
+            test_num = test_num + 1;
+            if (condition) begin
+                $display("  [PASS] T%0d: %s", test_num, test_name);
+                pass_count = pass_count + 1;
+            end else begin
+                $display("  [FAIL] T%0d: %s  @ time=%0t", test_num, test_name, $time);
+                fail_count = fail_count + 1;
+            end
+        end
+    endtask
+
+    // =========================================================================
+    // APB Protocol Monitor — runs in background, flags violations
+    // =========================================================================
+    // Rule 1: PENABLE must be 0 in SETUP phase (PSEL high, PENABLE low)
+    // Rule 2: PADDR/PWRITE/PWDATA must be stable during ACCESS
+    // Rule 3: PSEL must not be asserted when PENABLE is high but PSEL is low
+
+    reg [31:0] saved_paddr;
+    reg [31:0] saved_pwdata;
+    reg        saved_pwrite;
+    reg        in_setup;
+
+    always @(posedge PCLK) begin
+        if (PRESETn) begin
+            // Detect SETUP phase (PSEL high, PENABLE low)
+            if ((PSEL1 || PSEL2) && !PENABLE) begin
+                in_setup     = 1;
+                saved_paddr  = PADDR;
+                saved_pwdata = PWDATA;
+                saved_pwrite = PWRITE;
+            end
+
+            // In ACCESS, check signals are stable vs SETUP values
+            if ((PSEL1 || PSEL2) && PENABLE && in_setup) begin
+                if (PADDR !== saved_paddr)
+                    $display("  [PROTOCOL VIOLATION] PADDR changed from SETUP to ACCESS at time %0t", $time);
+                if (saved_pwrite && PWDATA !== saved_pwdata)
+                    $display("  [PROTOCOL VIOLATION] PWDATA changed from SETUP to ACCESS at time %0t", $time);
+                if (PWRITE !== saved_pwrite)
+                    $display("  [PROTOCOL VIOLATION] PWRITE changed from SETUP to ACCESS at time %0t", $time);
+                in_setup = 0;
+            end
+
+            // PENABLE must never be high when PSEL is low
+            if (PENABLE && !PSEL1 && !PSEL2)
+                $display("  [PROTOCOL VIOLATION] PENABLE high without PSEL at time %0t", $time);
+
+            // Both PSELs must never be simultaneously active
+            if (PSEL1 && PSEL2)
+                $display("  [PROTOCOL VIOLATION] PSEL1 and PSEL2 both asserted at time %0t", $time);
+        end
+    end
+
+    // =========================================================================
+    // VCD Dump
+    // =========================================================================
+    initial begin
+        $dumpfile("apb_tb.vcd");
+        $dumpvars(0, APB_tb);
+    end
+
+    // =========================================================================
+    // MAIN TEST SEQUENCE
+    // =========================================================================
+    reg [31:0] rdata;
+
+    initial begin
+        // ----- initialise -----------------------------------------------
+        test_num   = 0;
+        pass_count = 0;
+        fail_count = 0;
+        in_setup   = 0;
+        drive_idle;
+        PRESETn    = 0;
+
+        $display("\n========================================");
+        $display("  APB Testbench — Starting");
+        $display("========================================\n");
+
+        // ================================================================
+        // TEST GROUP 1 — RESET BEHAVIOUR
+        // ================================================================
+        $display("--- GROUP 1: Reset Behaviour ---");
+        clk_delay(3);
+
+        check("PSEL1 deasserted in reset",   PSEL1   === 1'b0);
+        check("PSEL2 deasserted in reset",   PSEL2   === 1'b0);
+        check("PENABLE deasserted in reset", PENABLE === 1'b0);
+        check("PSLVERR deasserted in reset", PSLVERR === 1'b0);
+
+        // Release reset
+        @(negedge PCLK);
+        PRESETn = 1;
+        clk_delay(2);
+
+        check("Bus idle after reset release — PSEL1 low",   PSEL1   === 1'b0);
+        check("Bus idle after reset release — PENABLE low", PENABLE === 1'b0);
+
+        // ================================================================
+        // TEST GROUP 2 — SINGLE WRITE TO SLAVE 1 (addr bit[8]=1)
+        // ================================================================
+        $display("\n--- GROUP 2: Single Write → Slave 1 (addr=0x1A5, data=0xDEADBEEF) ---");
+
+        apb_write(32'h0000_01A5, 32'hDEAD_BEEF, 4'b1111);
+        clk_delay(1);
+
+        check("No PSLVERR after valid write (Slave1)",   PSLVERR === 1'b0);
+        check("PSEL1 deasserted after transfer",         PSEL1   === 1'b0);
+        check("PENABLE deasserted after transfer",       PENABLE === 1'b0);
+
+        // ================================================================
+        // TEST GROUP 3 — READ BACK FROM SLAVE 1
+        // ================================================================
+        $display("\n--- GROUP 3: Read Back → Slave 1 (addr=0x1A5) ---");
+
+        apb_read(32'h0000_01A5, rdata);
+        clk_delay(1);
+
+        $display("  Read data = 0x%08X (expected 0xDEADBEEF)", rdata);
+        check("Read-back correct from Slave1",   rdata   === 32'hDEAD_BEEF);
+        check("No PSLVERR after valid read",     PSLVERR === 1'b0);
+
+        // ================================================================
+        // TEST GROUP 4 — WRITE / READ TO SLAVE 2 (addr bit[8]=0)
+        // ================================================================
+        $display("\n--- GROUP 4: Write + Read → Slave 2 (addr=0x042, data=0xCAFEBABE) ---");
+
+        apb_write(32'h0000_0042, 32'hCAFE_BABE, 4'b1111);
+        apb_read (32'h0000_0042, rdata);
+        clk_delay(1);
+
+        $display("  Read data = 0x%08X (expected 0xCAFEBABE)", rdata);
+        check("Read-back correct from Slave2", rdata === 32'hCAFE_BABE);
+
+        // ================================================================
+        // TEST GROUP 5 — BYTE-LANE WRITE STROBES (APB4)
+        // ================================================================
+        $display("\n--- GROUP 5: Byte-Lane Strobes (APB4) ---");
+
+        // First fill address 0x100 with all 0xFF
+        apb_write(32'h0000_0100, 32'hFFFF_FFFF, 4'b1111);
+
+        // Write only upper byte (strb=1000) with 0x12_______
+        apb_write(32'h0000_0100, 32'h1200_0000, 4'b1000);
+
+        apb_read(32'h0000_0100, rdata);
+        clk_delay(1);
+
+        $display("  Strobe test: Read data = 0x%08X (expected 0x12FFFFFF)", rdata);
+        check("Upper byte written, lower bytes unchanged (strobe)", rdata === 32'h12FF_FFFF);
+
+        // Write only lower byte (strb=0001)
+        apb_write(32'h0000_0100, 32'h0000_00AB, 4'b0001);
+        apb_read(32'h0000_0100, rdata);
+        clk_delay(1);
+
+        $display("  Strobe test: Read data = 0x%08X (expected 0x12FFFFAB)", rdata);
+        check("Lower byte written, others unchanged (strobe)", rdata === 32'h12FF_FFAB);
+
+        // ================================================================
+        // TEST GROUP 6 — BACK-TO-BACK TRANSFERS
+        // ================================================================
+        $display("\n--- GROUP 6: Back-to-Back Writes ---");
+
+        @(negedge PCLK);
+        READ_WRITE      = 0;
+        apb_write_paddr = 32'h0000_0110;
+        apb_write_data  = 32'hAAAA_AAAA;
+        pstrb_in        = 4'b1111;
+        transfer        = 1;
+
+        @(posedge PCLK); // IDLE→SETUP
+        @(posedge PCLK); // SETUP→ACCESS
+        while (!PREADY) @(posedge PCLK);
+
+        // Change address/data for next transfer while still active
+        @(negedge PCLK);
+        apb_write_paddr = 32'h0000_0111;
+        apb_write_data  = 32'hBBBB_BBBB;
+        // transfer stays high → back-to-back
+
+        @(posedge PCLK); // SETUP
+        @(posedge PCLK); // ACCESS
+        while (!PREADY) @(posedge PCLK);
+
+        @(negedge PCLK);
+        transfer = 0;
+        @(posedge PCLK);
+        #1;
+
+        // Verify both writes
+        apb_read(32'h0000_0110, rdata);
+        $display("  B2B addr 0x110 = 0x%08X (expected 0xAAAAAAAA)", rdata);
+        check("Back-to-back write 1 correct", rdata === 32'hAAAA_AAAA);
+
+        apb_read(32'h0000_0111, rdata);
+        $display("  B2B addr 0x111 = 0x%08X (expected 0xBBBBBBBB)", rdata);
+        check("Back-to-back write 2 correct", rdata === 32'hBBBB_BBBB);
+
+        // ================================================================
+        // TEST GROUP 7 — PSLVERR: INVALID WRITE ADDRESS (X)
+        // ================================================================
+        $display("\n--- GROUP 7: PSLVERR — Invalid Write Address (X) ---");
+
+        @(negedge PCLK);
+        READ_WRITE      = 0;
+        apb_write_paddr = 32'hxxxx_xxxx;  // invalid X
+        apb_write_data  = 32'h1234_5678;
+        transfer        = 1;
+        @(posedge PCLK);
+        @(posedge PCLK);
+        #1;
+        check("PSLVERR raised for X write address", PSLVERR === 1'b1);
+        @(negedge PCLK);
+        transfer = 0;
+        drive_idle;
+        clk_delay(3);
+
+        // ================================================================
+        // TEST GROUP 8 — PSLVERR: INVALID READ ADDRESS (X)
+        // ================================================================
+        $display("\n--- GROUP 8: PSLVERR — Invalid Read Address (X) ---");
+
+        @(negedge PCLK);
+        READ_WRITE     = 1;
+        apb_read_paddr = 32'hxxxx_xxxx;
+        transfer       = 1;
+        @(posedge PCLK);
+        @(posedge PCLK);
+        #1;
+        check("PSLVERR raised for X read address", PSLVERR === 1'b1);
+        @(negedge PCLK);
+        transfer = 0;
+        drive_idle;
+        clk_delay(3);
+
+        // ================================================================
+        // TEST GROUP 9 — PSLVERR: INVALID WRITE DATA (X)
+        // ================================================================
+        $display("\n--- GROUP 9: PSLVERR — Invalid Write Data (X) ---");
+
+        @(negedge PCLK);
+        READ_WRITE      = 0;
+        apb_write_paddr = 32'h0000_0120;
+        apb_write_data  = 32'hxxxx_xxxx;  // invalid X data
+        transfer        = 1;
+        @(posedge PCLK);
+        @(posedge PCLK);
+        #1;
+        check("PSLVERR raised for X write data", PSLVERR === 1'b1);
+        @(negedge PCLK);
+        transfer = 0;
+        drive_idle;
+        clk_delay(3);
+
+        // ================================================================
+        // TEST GROUP 10 — RECOVERY AFTER PSLVERR
+        // ================================================================
+        $display("\n--- GROUP 10: Recovery After PSLVERR ---");
+
+        // Valid write to Slave1 after error
+        apb_write(32'h0000_01FF, 32'h5A5A_5A5A, 4'b1111);
+        apb_read (32'h0000_01FF, rdata);
+        clk_delay(1);
+        $display("  Post-error read = 0x%08X (expected 0x5A5A5A5A)", rdata);
+        check("Recovery: correct write after PSLVERR",  rdata   === 32'h5A5A_5A5A);
+        check("Recovery: no PSLVERR on valid transfer", PSLVERR === 1'b0);
+
+        // ================================================================
+        // TEST GROUP 11 — NO TRANSFER (no spurious activity)
+        // ================================================================
+        $display("\n--- GROUP 11: No Transfer — Bus Must Stay Idle ---");
+
+        drive_idle;
+        clk_delay(5);
+        check("PSEL1 stays low with transfer=0",   PSEL1   === 1'b0);
+        check("PSEL2 stays low with transfer=0",   PSEL2   === 1'b0);
+        check("PENABLE stays low with transfer=0", PENABLE === 1'b0);
+
+        // ================================================================
+        // TEST GROUP 12 — PPROT PASS-THROUGH
+        // ================================================================
+        $display("\n--- GROUP 12: PPROT Pass-Through ---");
+
+        @(negedge PCLK);
+        pprot_in        = 3'b101;   // privileged, secure, instruction
+        READ_WRITE      = 0;
+        apb_write_paddr = 32'h0000_0130;
+        apb_write_data  = 32'h1111_1111;
+        pstrb_in        = 4'b1111;
+        transfer        = 1;
+        @(posedge PCLK);
+        @(posedge PCLK);
+        #1;
+        check("PPROT passes through correctly", PPROT === 3'b101);
+        while (!PREADY) @(posedge PCLK);
+        @(negedge PCLK);
+        transfer = 0;
+        pprot_in = 3'b000;
+        clk_delay(2);
+
+        // ================================================================
+        // TEST GROUP 13 — SIMULTANEOUS PSEL CHECK (bus arbitration)
+        // ================================================================
+        // Already monitored by the protocol monitor above.
+        // Add explicit check: write Slave2 and verify PSEL1 is not raised.
+        $display("\n--- GROUP 13: Slave Select Exclusivity ---");
+
+        @(negedge PCLK);
+        READ_WRITE      = 0;
+        apb_write_paddr = 32'h0000_0050;  // bit[8]=0 → Slave2
+        apb_write_data  = 32'h9999_9999;
+        pstrb_in        = 4'b1111;
+        transfer        = 1;
+        @(posedge PCLK); // →SETUP
+        #1;
+        check("Slave2 write: only PSEL2 asserted (PSEL1=0)", PSEL1 === 1'b0 && PSEL2 === 1'b1);
+        @(posedge PCLK); // →ACCESS
+        while (!PREADY) @(posedge PCLK);
+        @(negedge PCLK);
+        transfer = 0;
+        clk_delay(2);
+
+        @(negedge PCLK);
+        READ_WRITE      = 0;
+        apb_write_paddr = 32'h0000_0150;  // bit[8]=1 → Slave1
+        apb_write_data  = 32'h8888_8888;
+        transfer        = 1;
+        @(posedge PCLK); // →SETUP
+        #1;
+        check("Slave1 write: only PSEL1 asserted (PSEL2=0)", PSEL1 === 1'b1 && PSEL2 === 1'b0);
+        @(posedge PCLK); // →ACCESS
+        while (!PREADY) @(posedge PCLK);
+        @(negedge PCLK);
+        transfer = 0;
+        clk_delay(2);
+
+        // ================================================================
+        // RESULTS
+        // ================================================================
+        $display("\n========================================");
+        $display("  RESULTS: %0d PASSED, %0d FAILED  (of %0d)",
+                  pass_count, fail_count, test_num);
+        $display("========================================\n");
+
+        if (fail_count == 0)
+            $display("  *** ALL TESTS PASSED *** \n");
+        else
+            $display("  *** %0d TEST(S) FAILED — see above *** \n", fail_count);
+
+        $finish;
+    end
+
+    // =========================================================================
+    // Timeout watchdog — abort if simulation hangs for 50 us
+    // =========================================================================
+    initial begin
+        #50000;
+        $display("\n[WATCHDOG] Simulation timeout — possible infinite loop!\n");
+        $finish;
+    end
+
+endmodule
